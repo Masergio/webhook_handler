@@ -5,6 +5,7 @@ import gzip
 import psycopg2
 import psycopg2.extras
 
+AWS_BUCKET = "bucket"
 
 DB_HOST = "localhost"
 DB_PORT = 5432
@@ -76,44 +77,44 @@ def create_table(cur):
     )
 
 
-def main(file, host, port, database, user, password):
-    conn = None
-    print("Connect to the PostgreSQL database server")
+def main(db, file=None, s3_client=None):
+    if not db:
+        print("ERROR: No database connection")
+        return
+    if file:
+        total_contents = [read_data(file)]
+    elif s3_client:
+        bucket_prefixes = gen_date_prefix()
+        total_contents = retrieve_webhook_events(s3_client, bucket_prefixes)
+    else:
+        print("ERROR: No webhook resource")
+        return
+
     try:
-        conn = psycopg2.connect(
-            host=host,
-            port=port,
-            database=database,
-            user=user,
-            password=password,
-        )
-        print(f"connection: {conn}")
-        conn.autocommit = True
-
-        # Read webhook events
-        contents = read_data(file)
-        # print(f"contents: {contents}\n\n")
-
-        with conn.cursor() as cursor:
+        with db.cursor() as cursor:
             # Create table if not exists
             create_table(cursor)
             # Process webhook events data
             # events = [parse(campaign_event=json.loads(line.decode('utf-8'))) for line in contents]
-            events = []
-            for line in contents:
-                campaign_event = json.loads(line.decode('utf-8'))
-                parsed_event = parse(campaign_event)
-                if parsed_event:
-                    events.append(parsed_event)
-
-            print(f"Length events: {len(events)}")
-            # print(f"events: {events}\n\n")
-            save_data(cursor, events)
+            total_added_events = 0
+            for contents in total_contents:
+                events = []
+                for line in contents:
+                    campaign_event = json.loads(line.decode('utf-8'))
+                    parsed_event = parse(campaign_event)
+                    if parsed_event:
+                        events.append(parsed_event)
+                added_events = len(events)
+                print(f"Events added: {added_events}")
+                # print(f"events: {events}\n\n")
+                save_data(cursor, events)
+                total_added_events += added_events
+        print(f"Totally processed events: {total_added_events}")
     except Exception as err:
         print(repr(err))
     finally:
-        if conn is not None:
-            conn.close()
+        if db is not None:
+            db.close()
             print('Database connection closed.')
 
 
@@ -152,7 +153,7 @@ def parse(campaign_event: dict):
             message_id=campaign_event["sg_message_id"].split(".")[0],
             event_id=campaign_event["sg_event_id"],
             details=details,
-            timestamp=datetime.datetime.fromtimestamp(campaign_event["timestamp"]),
+            timestamp=datetime.datetime.utcfromtimestamp(campaign_event["timestamp"]),
         )
         return tuple([parse_campaign_event[field] for field in FIELDS])
 
@@ -166,46 +167,72 @@ def save_data(cur, events):
     )
 
 
-if __name__ == '__main__':
-    db_connection = {
-        "host": DB_HOST,
-        "port": DB_PORT,
-        "database": DB_NAME,
-        "user": DB_USER,
-        "password": DB_PASSWORD,
-    }
-    filename = "webhook_data.gz"
-    main(filename, **db_connection)
-
-
 def parse_events(file):
     with gzip.open(file, mode="rt") as f:
         file_content = f.read()
         print(file_content)
 
 
-def save_files():
-    s3_client = boto3.client("s3")
-    bucket = "spoton-prod-message-analytics"
-    bucket_prefix = "/2021/12"
-    result = s3_client.list_objects(Bucket=bucket, Prefix=bucket_prefix)
-    for obj in result.get('Contents'):
-        data = s3_client.get_object(Bucket=bucket, Key=obj.get("Key"))
-        contents = data['Body'].read().splitlines()
-        print(f"Content length: {len(contents)}")
-        for i, line in enumerate(contents):
-            if i < 10:
-                parsed_data = json.loads(line.decode('utf-8'))
-                print(f"parsed_data: {parsed_data}")
-            else:
-                break
+def create_s3_client():
+    # AWS_REGION = "us-east-1",
+    # AWS_ACCESS_KEY_ID = ,
+    # AWS_SECRET_ACCESS_KEY = ,
+    # AWS_SESSION_TOKEN =
+    # AWS_BUCKET = "spoton-prod-message-analytics"
+    s3_client = boto3.client(
+        service_name="s3",
+    )
+    return s3_client
 
-        # # Download and Save file locally
-        # path, filename = os.path.split(obj.get("Key"))
-        # # boto3 s3 download_file will throw exception if folder not exists
-        # try:
-        #     os.makedirs(path)
-        # except FileExistsError:
-        #     pass
-        # with open(filename, 'wb') as data:
-        #     s3_client.download_fileobj(bucket, obj.get("Key"), data)
+
+def connect_db():
+    conn = None
+    print("Connect to the PostgreSQL database server")
+    try:
+        conn = psycopg2.connect(
+            host=DB_HOST,
+            port=DB_PORT,
+            database=DB_NAME,
+            user=DB_USER,
+            password=DB_PASSWORD,
+        )
+        print(f"connection: {conn}")
+        conn.autocommit = True
+    except Exception as err:
+        print(repr(err))
+    return conn
+
+
+def gen_date_prefix():
+    prefixes = [f"2021/12/{dd}/{hh:02d}/" for dd in range(23, 29) for hh in range(0, 24)]
+    return prefixes
+
+
+def retrieve_webhook_events(s3_client, prefixes):
+    total_contents = []
+    total_contents_number = 0
+    for bucket_prefix in prefixes:
+        print(f"* date bucket_prefix: {bucket_prefix}")
+        result = s3_client.list_objects(Bucket=AWS_BUCKET, Prefix=bucket_prefix)
+        # print(f"S3 Bucket list_objects: {result}\n\n")
+        print(f"S3 Bucket content: {len(result.get('Contents'))}")
+
+        for obj in result.get('Contents'):
+            data = s3_client.get_object(Bucket=AWS_BUCKET, Key=obj.get("Key"))
+            contents = gzip.GzipFile(fileobj=data['Body']).read().splitlines()
+            content_len = len(contents)
+            total_contents_number += content_len
+            print(f"Content length: {content_len}")
+
+            total_contents.append(contents)
+    print(f"*** total_contents length: {total_contents_number}")
+    return total_contents
+
+
+if __name__ == '__main__':
+    try:
+        client = create_s3_client()
+        db_connection = connect_db()
+        main(db=db_connection, s3_client=client)
+    except Exception as error:
+        print(repr(error))
